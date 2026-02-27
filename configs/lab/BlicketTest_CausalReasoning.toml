@@ -1,5 +1,5 @@
-model = "allenai/OLMo-3-7B-Instruct"
-max_steps = 350
+model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+max_steps = 325
 batch_size = 256
 rollouts_per_example = 16
 learning_rate = 1.5e-5
