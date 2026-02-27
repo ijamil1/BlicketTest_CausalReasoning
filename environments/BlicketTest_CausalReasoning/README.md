@@ -11,7 +11,7 @@ Based on [Do LLMs Think Like Scientists? Causal Reasoning and Hypothesis Testing
 ### Task
 - **Type**: multi-turn
 - **Parser**: XMLParser (fields: `reasoning`, `action`)
-- **Rubric overview**: Reward is a weighted combination of four active components: blicket set Jaccard similarity (0.5), per-step efficiency vs. the optimal agent (0.3), exploration efficiency (0.1), and format compliance (0.1). `hypotheses_eliminated` is retained at weight 0.0 for metric logging.
+- **Rubric overview**: Reward is a weighted combination of four active components: blicket set Jaccard similarity (0.9) and format compliance (0.1).
 
 The agent interacts with a simulated "Blicket-detecting machine" across two phases:
 1. **Exploration phase** — toggle objects on/off the machine one at a time, observe whether the machine activates, and exit when ready.
@@ -146,8 +146,8 @@ List only the IDs of objects believed to be Blickets inside curly braces. Use `<
 
 | Component | Weight | Meaning |
 | --------- | ------ | ------- |
-| `blicket_set_jaccard` | 0.5 | Jaccard similarity between predicted and gold Blicket sets |
-| `per_step_efficiency` | 0.3 | Per-step ratio of agent's hypotheses eliminated vs. `optimal_avg[t]` (average hypotheses eliminated by the info-maximizing oracle at step `t`); penalizes under-exploration with ratio 0 for steps the agent never took |
-| `exploration_efficiency` | 0.1 | `1 - (wasted / parseable)` — fraction of productive actions |
+| `blicket_set_jaccard` | 0.9 | Jaccard similarity between predicted and gold Blicket sets |
+| `per_step_efficiency` | 0.0 | Per-step ratio of agent's hypotheses eliminated vs. `optimal_avg[t]` (average hypotheses eliminated by the info-maximizing oracle at step `t`); penalizes under-exploration with ratio 0 for steps the agent never took |
+| `exploration_efficiency` | 0.0 | `1 - (wasted / parseable)` — fraction of productive actions |
 | `format_compliance` | 0.1 | Parseable actions across all turns (both phases) |
 | `hypotheses_eliminated` | 0.0 | Fraction of hypotheses eliminated vs. theoretical maximum (metric only) |
