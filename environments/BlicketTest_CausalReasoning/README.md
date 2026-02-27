@@ -11,7 +11,7 @@ Based on [Do LLMs Think Like Scientists? Causal Reasoning and Hypothesis Testing
 ### Task
 - **Type**: multi-turn
 - **Parser**: XMLParser (fields: `reasoning`, `action`)
-- **Rubric overview**: Reward is a weighted combination of four active components: blicket set Jaccard similarity (0.9) and format compliance (0.1).
+- **Rubric overview**: Reward is a weighted combination of active components: blicket set Jaccard similarity (0.5), format compliance (0.05), per-step information-seeking efficiency (0.1), and posterior Jaccard (0.35).
 
 The agent interacts with a simulated "Blicket-detecting machine" across two phases:
 1. **Exploration phase** — toggle objects on/off the machine one at a time, observe whether the machine activates, and exit when ready.
@@ -61,7 +61,7 @@ Training and eval datasets are generated independently and are guaranteed to be 
 
 **Rollout lifecycle:**
 
-1. `setup_state()` reads per-row config from the dataset `info` field (blickets, rule type, step budget, and pre-computed optimal agent data). Initializes zeroed object states, the full hypothesis space (2^N blicket assignments × 2 rule types), and tracking counters.
+1. `setup_state()` reads per-row config from the dataset `info` field (blickets, rule type, step budget, and pre-computed total hypotheses to eliminate). Initializes zeroed object states, the full hypothesis space (2^N blicket assignments × 2 rule types), and tracking counters.
 2. `env_response()` drives the game loop across both phases. All turns increment `exploration_and_answer_count`:
    - **Exploration**: calls `parse_response(..., "exploration", ...)` which strips reasoning blocks, requires exactly one `<action>` tag, and delegates to `parse_action`. Validates the action, toggles object state, computes machine activation, filters the hypothesis space against the observation, records hypotheses eliminated this step into `hypotheses_eliminated_per_step`, and returns a compact observation. Invalid and redundant actions still consume a step.
    - **Answer**: calls `parse_response(..., "answer", ...)` which applies the same strict tag rules then delegates to `parse_blicket_set`. On successful parse, scores with Jaccard similarity and terminates. On failure, sends a reformat message and loops up to `MAX_ANSWER_ATTEMPTS` (3) total attempts; if all exhausted, exits with score 0.
@@ -104,8 +104,8 @@ List only the IDs of objects believed to be Blickets inside curly braces. Use `<
 
 **Environment class:**
 - `BlicketEnv(vf.MultiTurnEnv)`
-  - `setup_state()` — reads pre-computed per-row config from dataset `info`. Initializes blicket array, zeroed object/machine states, step counter, phase tracker, history log, hypothesis space, and action-tracking counters (`total_action_count`, `exploration_and_answer_count`, `parseable_action_count`, `valid_action_count`, `redundant_action_count`, `out_of_range_count`, `answer_attempt_count`). Also loads `optimal_hypotheses_eliminated` and `optimal_hyp_eliminated_per_step` for use by reward functions.
-  - `env_response()` — core game loop. Handles exploration (parse action via `parse_response`, validate, toggle, compute machine state, filter hypotheses, record per-step eliminations, return observation) and answer phase (parse predictions via `parse_response`, retry loop up to `MAX_ANSWER_ATTEMPTS`, score and signal termination on success).
+  - `setup_state()` — reads pre-computed per-row config from dataset `info`. Initializes blicket array, zeroed object/machine states, step counter, phase tracker, history log, hypothesis space, and action-tracking counters (`total_action_count`, `exploration_and_answer_count`, `parseable_action_count`, `valid_action_count`, `redundant_action_count`, `out_of_range_count`, `answer_attempt_count`). Also loads `optimal_hypotheses_eliminated` for use by the `hypotheses_eliminated` diagnostic.
+  - `env_response()` — core game loop. Handles exploration (parse action via `parse_response`, validate, toggle, compute machine state, filter hypotheses, record per-step eliminations, return observation) and answer phase (parse predictions via `parse_response`, retry loop up to `MAX_ANSWER_ATTEMPTS`, score via Jaccard and signal termination on success). On valid answer, stores both `state["final_score"]` (Jaccard) and `state["final_predictions"]` (the raw predicted set) for reward functions.
   - `_build_transition_message()` — assembles the observation history recap when moving to answer phase.
 
 **Helper functions:**
@@ -118,17 +118,20 @@ List only the IDs of objects believed to be Blickets inside curly braces. Use `<
 - `build_initial_message()` — constructs the opening user message presenting the game.
 - `format_observation()` — formats a compact observation (step counter, action, object lists, machine state).
 - `format_history()` — formats the full observation history for the transition message.
-- `compute_optimal_steps(num_objects, blickets, rule_type, num_samples, seed)` — simulates a greedy info-gain-maximizing agent `num_samples` times. Returns `(avg_steps, total_hypotheses_to_eliminate, per_step_avg_eliminated)`, where `per_step_avg_eliminated[t]` is the average hypotheses eliminated at step `t+1` across all simulation trajectories that were still active at that step.
+- `compute_optimal_steps(num_objects, blickets, rule_type, num_samples, seed)` — simulates a greedy info-gain-maximizing agent `num_samples` times. At each step the agent picks the single-object toggle that most evenly bisects the remaining hypothesis space; ties broken by preferring unseen configurations, then randomly. Returns `(avg_steps, total_hypotheses_to_eliminate)`.
 - `sample_unique_configs(num_objects_range, n, seed)` — rejection-samples `n` unique `(n_obj, rule, blickets)` configs from the given n range with no rule-balance constraint.
 - `sample_balanced_configs(num_objects_range, n_conjunctive, n_disjunctive, exclude_keys, seed)` — rejection-samples exactly `n_conjunctive` conjunctive and `n_disjunctive` disjunctive configs, skipping any keys in `exclude_keys` to guarantee disjointness with another set.
-- `build_rows(configs)` — converts a list of configs into HuggingFace dataset rows. For each config, calls `compute_optimal_steps` (with a deterministic per-config seed derived from MD5) and stores `optimal_hypotheses_eliminated` and `optimal_hyp_eliminated_per_step` in the `info` JSON field.
+- `build_rows(configs)` — converts a list of configs into HuggingFace dataset rows. For each config, calls `compute_optimal_steps` (with a deterministic per-config seed derived from MD5) and stores `optimal_hypotheses_eliminated` in the `info` JSON field.
 
 **Reward functions:**
 - `blicket_set_jaccard()` — reads `state["final_score"]`, set by `env_response` as the Jaccard similarity between the predicted Blicket set and the gold set. Returns 0.0 if no valid answer was recorded.
-- `exploration_efficiency()` — `1 - (wasted / parseable_action_count)`, where waste = redundant actions + out-of-range object IDs + non-contiguous configuration revisits. Higher is better.
+- `exploration_efficiency()` — `1 - (wasted / parseable_action_count)`, where waste = redundant actions + out-of-range object IDs + non-contiguous configuration revisits. Higher is better. Weight 0.0 (retained for metric logging only).
 - `format_compliance()` — `parseable_action_count / exploration_and_answer_count` across all turns in both phases. Higher is better.
 - `hypotheses_eliminated()` — fraction of total hypotheses eliminated relative to the theoretical maximum (`2^(N+1) - 1`). Weight 0.0 (retained for metric logging only).
-- `per_step_efficiency()` — measures how closely the agent matches the information gain of a greedy oracle at each exploration step. The oracle is an information-maximizing agent simulated `num_samples` times: at every step it picks the single-object toggle that most evenly splits the remaining hypothesis space, and `optimal_avg[t]` is the average number of hypotheses it eliminates at step `t` across all simulation runs that were still active at that point (runs that terminated earlier are excluded from the average for that step, reflecting that the oracle had already solved the problem). The reward iterates over the oracle's steps: if the agent took step `t`, `ratio = min(1.0, agent_elim[t] / optimal_avg[t])`; if the agent exited before step `t`, `ratio = 0.0`, penalizing under-exploration. Steps where `optimal_avg[t] == 0` (no information gain possible even for the oracle) are excluded entirely. Returns the mean of included ratios.
+- `per_step_efficiency_dynamic()` — counterfactual per-step information-seeking reward. At each step `t`, reconstructs the agent's hypothesis set H_t from the initial space filtered by all prior observations, then computes: (1) `agent_balance(t)` = min(on_count, off_count) for the agent's actual toggle applied to H_t; (2) `optimal_balance(t)` = max over all N possible single-object toggles of min(on_count, off_count) from H_t. Returns the mean of `agent_balance / optimal_balance` across steps where `optimal_balance > 0`. Unlike the old path-dependent oracle comparison, the baseline is always computed from the agent's actual belief state at each step.
+- `posterior_jaccard()` — at the end of exploration, computes the mean Jaccard similarity between each remaining valid hypothesis's implied blicket set and the gold blicket set (rule type ignored). Rewards the agent for narrowing the hypothesis space to hypotheses close to the truth, independently of the final answer.
+- `blicket_precision()` — `TP / |predicted|` over the final predicted blicket set. Weight 0.0 (diagnostic: decompose identification failures into overclaiming vs. missing).
+- `blicket_recall()` — `TP / |gold|` over the final predicted blicket set. Weight 0.0 (diagnostic: decompose identification failures into overclaiming vs. missing).
 
 ### Counters
 
@@ -146,8 +149,11 @@ List only the IDs of objects believed to be Blickets inside curly braces. Use `<
 
 | Component | Weight | Meaning |
 | --------- | ------ | ------- |
-| `blicket_set_jaccard` | 0.9 | Jaccard similarity between predicted and gold Blicket sets |
-| `per_step_efficiency` | 0.0 | Per-step ratio of agent's hypotheses eliminated vs. `optimal_avg[t]` (average hypotheses eliminated by the info-maximizing oracle at step `t`); penalizes under-exploration with ratio 0 for steps the agent never took |
-| `exploration_efficiency` | 0.0 | `1 - (wasted / parseable)` — fraction of productive actions |
-| `format_compliance` | 0.1 | Parseable actions across all turns (both phases) |
-| `hypotheses_eliminated` | 0.0 | Fraction of hypotheses eliminated vs. theoretical maximum (metric only) |
+| `blicket_set_jaccard` | 0.50 | Jaccard similarity between predicted and gold Blicket sets |
+| `posterior_jaccard` | 0.35 | Mean Jaccard of remaining hypotheses against gold at end of exploration |
+| `per_step_efficiency_dynamic` | 0.10 | Counterfactual info-seeking reward: agent's action balance vs. optimal balance from the same belief state |
+| `format_compliance` | 0.05 | Parseable actions across all turns (both phases) |
+| `exploration_efficiency` | 0.00 | `1 - (wasted / parseable)` — fraction of productive actions (diagnostic) |
+| `hypotheses_eliminated` | 0.00 | Fraction of hypotheses eliminated vs. theoretical maximum (diagnostic) |
+| `blicket_precision` | 0.00 | `TP / \|predicted\|` — overclaiming diagnostic |
+| `blicket_recall` | 0.00 | `TP / \|gold\|` — missing-blicket diagnostic |

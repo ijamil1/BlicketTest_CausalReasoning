@@ -214,7 +214,7 @@ def compute_optimal_steps(
     rule_type: str,
     num_samples: int = 10,
     seed: int = 0,
-) -> tuple[float, int, list[float]]:
+) -> tuple[float, int]:
     """Compute average exploration steps for a greedy info-gain-maximizing agent.
 
     Simulates an agent that at each step selects the single-object toggle which
@@ -228,9 +228,7 @@ def compute_optimal_steps(
     stops when only one hypothesis remains.
 
     Returns:
-        (avg_steps, total_hypotheses_to_eliminate, per_step_avg_eliminated)
-        where per_step_avg_eliminated[t] is the average hypotheses eliminated at
-        step t+1 across all trajectories that were still active at that step.
+        (avg_steps, total_hypotheses_to_eliminate)
     """
     rng = np.random.default_rng(seed)
     run_seeds = rng.integers(0, 2**31, size=num_samples)
@@ -257,8 +255,6 @@ def compute_optimal_steps(
 
     max_iters = 2 ** (num_objects + 1)  # safety bound
     total_steps = 0
-    step_elim_sums: list[float] = []
-    step_elim_counts: list[int] = []
 
     for rs in run_seeds:
         run_rng = np.random.default_rng(int(rs))
@@ -266,7 +262,6 @@ def compute_optimal_steps(
         active = list(init_active)
         visited = {init_state}
         steps = 0
-        traj_elim: list[int] = []
 
         while steps < max_iters and len(active) > 1:
             # Compute balance for every possible toggle
@@ -291,33 +286,17 @@ def compute_optimal_steps(
             else:
                 action = int(run_rng.choice([i for i, _ in tied]))
 
-            prev_len = len(active)
             obj_states[action] = 1 - obj_states[action]
             visited.add(tuple(obj_states))
             actual = predict(obj_states, blickets, rule_type)
             active = [
                 (b, r) for b, r in active if predict(obj_states, b, r) == actual
             ]
-            traj_elim.append(prev_len - len(active))
             steps += 1
 
         total_steps += steps
 
-        # Aggregate this trajectory's per-step eliminations
-        for t, elim in enumerate(traj_elim):
-            if t >= len(step_elim_sums):
-                step_elim_sums.append(0.0)
-                step_elim_counts.append(0)
-            step_elim_sums[t] += elim
-            step_elim_counts[t] += 1
-
-    per_step_avg = [
-        step_elim_sums[t] / step_elim_counts[t]
-        for t in range(len(step_elim_sums))
-        if step_elim_counts[t] > 0
-    ]
-
-    return total_steps / num_samples, len(all_hypotheses) - 1, per_step_avg
+    return total_steps / num_samples, len(all_hypotheses) - 1
 
 
 # --- Environment class ---
@@ -352,7 +331,6 @@ class BlicketEnv(vf.MultiTurnEnv):
         state["answer_attempt_count"] = 0
         state["max_answer_attempts"] = MAX_ANSWER_ATTEMPTS
         state["optimal_hypotheses_eliminated"] = info["optimal_hypotheses_eliminated"]
-        state["optimal_hyp_eliminated_per_step"] = info["optimal_hyp_eliminated_per_step"]
 
         # Initialize hypothesis space: all (blicket_assignment, rule_type) pairs
         # 2^N blicket assignments × 2 rule types = 2^(N+1) hypotheses
@@ -414,6 +392,7 @@ class BlicketEnv(vf.MultiTurnEnv):
             union = len(predictions | gold_set)
             score = len(predictions & gold_set) / union if union > 0 else 1.0
             state["final_score"] = score
+            state["final_predictions"] = predictions
             final_msg = (
                 f"Your answer has been recorded. "
                 f"You identified {sorted(predictions)} as Blickets. "
@@ -634,40 +613,189 @@ async def hypotheses_eliminated(state) -> float:
     return min(1.0, eliminated / optimal)
 
 
-async def per_step_efficiency(state) -> float:
-    """Reward: average ratio of agent's hypotheses eliminated per step vs optimal agent.
+async def per_step_efficiency_dynamic(state) -> float:
+    """Reward: counterfactual per-step information-seeking efficiency.
 
-    Iterates over the optimal agent's steps. For each step t:
-    - If optimal_avg[t] == 0, the step is excluded from the average.
-    - If the agent took step t, ratio = min(1.0, agent_elim[t] / optimal_avg[t]).
-    - If the agent did NOT take step t (exited early), ratio = 0.0, penalizing
-      the agent for exploring fewer steps than the optimal agent.
+    At each step t in the agent's actual history, reconstructs the hypothesis
+    set H_t from the initial hypothesis space filtered by all observations
+    prior to step t.  Then computes:
 
-    Returns the mean of included ratios, or 0.0 if no steps qualify.
+      agent_balance(t)   = min(on_count, off_count) for the agent's actual
+                           action applied to H_t, where on_count is the number
+                           of hypotheses in H_t that predict ON after that toggle.
+      optimal_balance(t) = max over all N possible single-object toggles of
+                           min(on_count, off_count) from H_t.
+      ratio(t)           = agent_balance / optimal_balance
+
+    Steps where optimal_balance == 0 (no action can split the hypothesis set)
+    are excluded from the average.
+
+    Returns the mean ratio across included steps, or 0.0 if none qualify.
+    This is path-independent: the baseline is always the best action available
+    from the agent's actual belief state at each step.
     """
-    agent_per_step = state.get("hypotheses_eliminated_per_step", [])
-    optimal_per_step = state.get("optimal_hyp_eliminated_per_step", [])
+    history = state.get("history", [])
+    num_objects = state.get("num_objects", 0)
+    blickets = state.get("blickets")
+    rule_type = state.get("rule_type", "")
 
-    if not optimal_per_step:
+    if not history or blickets is None:
         return 0.0
+
+    blicket_list = blickets.tolist()
+
+    def predict(obj_states: list, bits: tuple, rule: str) -> int:
+        active = [obj_states[i] for i in range(num_objects) if bits[i]]
+        return int(any(active)) if rule == "disjunctive" else int(all(active))
+
+    # Full initial hypothesis space: 2^N blicket assignments × 2 rule types
+    full_hypotheses = [
+        (bits, rule)
+        for bits in product((0, 1), repeat=num_objects)
+        for rule in ("disjunctive", "conjunctive")
+    ]
+
+    # Apply initial observation: all objects off, machine state before first action
+    init_states = [0] * num_objects
+    init_machine = predict(init_states, tuple(blicket_list), rule_type)
+    current_hypotheses = [
+        (bits, rule) for bits, rule in full_hypotheses
+        if predict(init_states, bits, rule) == init_machine
+    ]
 
     ratios = []
-    for t, optimal_avg in enumerate(optimal_per_step):
-        if t < len(agent_per_step):
-            if optimal_avg == 0:
-                # No information gain achievable at this step — exclude
-                ratio = 1
-            else:
-                ratio = min(1.0, agent_per_step[t] / optimal_avg)
-        else:
-            # Agent exited before this step — penalize with 0
-            ratio = 0.0
-        ratios.append(ratio)
+    current_obj_states = list(init_states)
 
-    if not ratios:
+    for entry in history:
+        # Parse action: "put N on/off" → 0-indexed object and target state
+        parts = entry["action"].split()
+        obj_idx = int(parts[1]) - 1
+        target_state = 1 if parts[2] == "on" else 0
+
+        # Compute new object states after this action
+        new_obj_states = list(current_obj_states)
+        new_obj_states[obj_idx] = target_state
+
+        # Compute balance for the agent's actual action applied to H_t
+        on_count_agent = sum(
+            1 for bits, rule in current_hypotheses
+            if predict(new_obj_states, bits, rule) == 1
+        )
+        agent_balance = min(on_count_agent, len(current_hypotheses) - on_count_agent)
+
+        # Compute optimal balance: best min-split over all possible single-object toggles
+        optimal_balance = 0
+        for i in range(num_objects):
+            trial = list(current_obj_states)
+            trial[i] = 1 - trial[i]
+            on_count_trial = sum(
+                1 for bits, rule in current_hypotheses
+                if predict(trial, bits, rule) == 1
+            )
+            trial_balance = min(on_count_trial, len(current_hypotheses) - on_count_trial)
+            if trial_balance > optimal_balance:
+                optimal_balance = trial_balance
+
+        if optimal_balance > 0:
+            ratios.append(min(1.0, agent_balance / optimal_balance))
+
+        # Update hypothesis set using this step's observation
+        machine_obs = entry["machine_state"]
+        current_hypotheses = [
+            (bits, rule) for bits, rule in current_hypotheses
+            if predict(new_obj_states, bits, rule) == machine_obs
+        ]
+        current_obj_states = new_obj_states
+
+    return sum(ratios) / len(ratios) if ratios else 0.0
+
+
+async def posterior_jaccard(state) -> float:
+    """Reward: average Jaccard similarity of remaining hypotheses against gold blicket set.
+
+    At the end of exploration, state["valid_hypotheses"] contains all hypotheses
+    still consistent with the agent's observations.  For each remaining hypothesis,
+    computes the Jaccard similarity of its implied blicket set against the gold
+    blicket set (rule type is ignored — this measures blicket identification only).
+
+    A tightly constrained hypothesis set close to the truth yields a high score;
+    a diffuse or wrong-leaning set yields a low score.  This provides a dense
+    reward signal for exploration quality independent of the final answer.
+
+    Returns the mean Jaccard across remaining hypotheses, or 0.0 if none remain.
+    """
+    remaining = state.get("valid_hypotheses", [])
+    if not remaining:
         return 0.0
 
-    return sum(ratios) / len(ratios)
+    num_objects = state.get("num_objects", 0)
+    blickets = state.get("blickets")
+    if blickets is None:
+        return 0.0
+
+    gold_set = {i + 1 for i in range(num_objects) if blickets[i] == 1}
+
+    total = 0.0
+    for bits, _ in remaining:
+        pred_set = {i + 1 for i in range(num_objects) if bits[i] == 1}
+        union = len(pred_set | gold_set)
+        total += len(pred_set & gold_set) / union if union > 0 else 1.0
+
+    return total / len(remaining)
+
+
+async def blicket_precision(state) -> float:
+    """Metric (0-weighted): precision of the predicted blicket set.
+
+    precision = TP / |predicted|
+
+    Returns 1.0 if both predicted and gold sets are empty, 0.0 if the agent
+    made no valid prediction.
+    """
+    predictions = state.get("final_predictions")
+    if predictions is None:
+        return 0.0
+
+    num_objects = state.get("num_objects", 0)
+    blickets = state.get("blickets")
+    if blickets is None:
+        return 0.0
+
+    gold_set = {i + 1 for i in range(num_objects) if blickets[i] == 1}
+
+    if len(predictions) == 0 and len(gold_set) == 0:
+        return 1.0
+    if len(predictions) == 0:
+        return 0.0
+
+    tp = len(predictions & gold_set)
+    return tp / len(predictions)
+
+
+async def blicket_recall(state) -> float:
+    """Metric (0-weighted): recall of the predicted blicket set.
+
+    recall = TP / |gold|
+
+    Returns 1.0 if gold set is empty (nothing to find), 0.0 if the agent
+    made no valid prediction and gold is non-empty.
+    """
+    num_objects = state.get("num_objects", 0)
+    blickets = state.get("blickets")
+    if blickets is None:
+        return 0.0
+
+    gold_set = {i + 1 for i in range(num_objects) if blickets[i] == 1}
+
+    if len(gold_set) == 0:
+        return 1.0
+
+    predictions = state.get("final_predictions")
+    if predictions is None:
+        return 0.0
+
+    tp = len(predictions & gold_set)
+    return tp / len(gold_set)
 
 
 # --- Normalized rubric ---
@@ -808,7 +936,7 @@ def build_rows(configs: list[dict]) -> tuple[list[dict], int]:
     for cfg in configs:
         seed_str = f"{cfg['n_obj']}_{cfg['rule']}_{cfg['blicket_indices']}"
         row_seed = int(hashlib.md5(seed_str.encode()).hexdigest()[:8], 16)
-        optimal_steps, hyps_elim, optimal_per_step = compute_optimal_steps(
+        optimal_steps, hyps_elim = compute_optimal_steps(
             cfg["n_obj"], cfg["blickets"], cfg["rule"], seed=row_seed
         )
         max_steps = max(1, math.ceil(1.5 * optimal_steps))
@@ -826,7 +954,6 @@ def build_rows(configs: list[dict]) -> tuple[list[dict], int]:
                 "rule_type": cfg["rule"],
                 "blickets": cfg["blickets"],
                 "optimal_hypotheses_eliminated": hyps_elim,
-                "optimal_hyp_eliminated_per_step": optimal_per_step,
             }),
         })
     return rows, global_max_steps
@@ -908,8 +1035,17 @@ def load_environment(num_examples: int = 250) -> vf.Environment:
 
     # Build rubric
     rubric = NormalizedRubric(
-        funcs=[blicket_set_jaccard, exploration_efficiency, format_compliance, hypotheses_eliminated, per_step_efficiency],
-        weights=[0.9, 0.0, 0.1, 0.0, 0.0],
+        funcs=[
+            blicket_set_jaccard,           # primary identification reward
+            exploration_efficiency,         # parseable/productive action ratio
+            format_compliance,             # format adherence
+            hypotheses_eliminated,         # diagnostic (0-weight)
+            per_step_efficiency_dynamic,   # counterfactual info-seeking reward
+            posterior_jaccard,             # exploration quality reward
+            blicket_precision,             # diagnostic (0-weight)
+            blicket_recall,                # diagnostic (0-weight)
+        ],
+        weights=[0.5, 0.0, 0.05, 0.0, 0.1, 0.35, 0.0, 0.0],
         parser=parser,
     )
 
