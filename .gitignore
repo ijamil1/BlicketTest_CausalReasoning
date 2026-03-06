@@ -12,10 +12,11 @@ test_dataset_determinism*
 validate_eval_result*
 tests*
 docs/
-rollout_rewards.sh
 .claude/settings.local.json
 scripts/*
 environments/BlicketTest_CausalReasoning/find_train_eval_overlap.py
-/Users/irfanjamil/BlicketTest_CausalReasoning/environments/BlicketTest_CausalReasoning/build_new_eval_dataset.py
+environments/BlicketTest_CausalReasoning/profile_eval_dataset.py
+environments/BlicketTest_CausalReasoning/profile_train_dataset.py
 environments/BlicketTest_CausalReasoning/upload_eval_dataset.py
 environments/BlicketTest_CausalReasoning/environments/BlicketTest_CausalReasoning/datasets/new_eval
+environments/BlicketTest_CausalReasoning/build_new_eval_dataset.py

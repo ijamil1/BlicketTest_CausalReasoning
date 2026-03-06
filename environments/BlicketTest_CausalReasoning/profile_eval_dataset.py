@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["matplotlib", "numpy"]
+# dependencies = ["matplotlib", "numpy", "datasets"]
 # ///
 """
-Profile an evaluation dataset from a results.jsonl file.
+Profile the evaluation dataset loaded from HuggingFace (irfanjamil/BlicketEnv_Eval_Set).
 
-The file contains 300 records (100 unique examples × 3 rollouts each).
-This script deduplicates by example_id and provides:
+Provides:
   - Counts per rule type
   - Counts per number of objects
   - Counts per (num_objects, num_blickets) combination
@@ -16,31 +15,31 @@ This script deduplicates by example_id and provides:
 
 import argparse
 import json
-import sys
 from collections import Counter
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
+from datasets import load_dataset
+
+HF_REPO = "irfanjamil/BlicketEnv_Eval_Set"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Data loading
 # ──────────────────────────────────────────────────────────────────────────────
 
-def load_unique_examples(path: Path) -> list[dict]:
-    """Load jsonl, keeping only the first occurrence of each example_id."""
-    seen: set[int] = set()
-    unique: list[dict] = []
-    with open(path) as fh:
-        for line in fh:
-            record = json.loads(line)
-            eid = record["example_id"]
-            if eid not in seen:
-                seen.add(eid)
-                unique.append(record)
-    return unique
+def load_from_hf(repo: str = HF_REPO, split: str = "eval") -> list[dict]:
+    """Load dataset from HuggingFace and normalise info to a dict."""
+    ds = load_dataset(repo, split=split)
+    examples = []
+    for row in ds:
+        record = dict(row)
+        if isinstance(record["info"], str):
+            record["info"] = json.loads(record["info"])
+        examples.append(record)
+    return examples
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -276,22 +275,17 @@ def visualize(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Profile a BlicketTest evaluation results.jsonl file."
+        description="Profile the BlicketEnv eval dataset from HuggingFace."
     )
     parser.add_argument(
-        "jsonl",
-        nargs="?",
-        default=(
-            "outputs/evals/"
-            "BlicketTest_CausalReasoning--anthropic--claude-3.5-haiku/"
-            "b82c5c9b/results.jsonl"
-        ),
-        help="Path to results.jsonl (default: claude-3.5-haiku result)",
+        "--repo",
+        default=HF_REPO,
+        help=f"HuggingFace dataset repo (default: {HF_REPO})",
     )
     parser.add_argument(
         "--save",
         metavar="FILE",
-        default="datasets_profile/eval_profile.png",
+        default="environments/BlicketTest_CausalReasoning/datasets_profile/eval_profile.png",
         help="Save figure to FILE instead of displaying it (e.g. profile.png)",
     )
 
@@ -300,11 +294,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    path = Path(args.jsonl)
-    if not path.exists():
-        sys.exit(f"Error: file not found: {path}")
-
-    examples = load_unique_examples(path)
+    examples = load_from_hf(repo=args.repo)
 
     rule_counts        = count_rule_types(examples)
     obj_counts         = count_num_objects(examples)
