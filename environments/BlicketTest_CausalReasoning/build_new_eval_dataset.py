@@ -4,8 +4,8 @@
 # ///
 """Build a new, fully disjoint eval dataset with:
   - 100 examples: 62 conjunctive + 38 disjunctive
-  - num_objects ∈ [8, 15]
-  - num_blickets ∈ [5, floor(0.7 * num_objects)]
+  - num_objects sampled from N(9.5, 1.5), clipped to [5, 13], centered around 8-11
+  - num_blickets ∈ [2, 8]
   - Distinct from the full training pool (seed=42, n∈[4,10]) and both
     existing eval splits (seed=100, n∈[4,10] and n∈[11,15])
 
@@ -91,7 +91,7 @@ def compute_optimal_steps(
     num_objects: int,
     blickets: list[int],
     rule_type: str,
-    num_samples: int = 10,
+    num_samples: int = 3,
     seed: int = 0,
 ) -> tuple[float, int]:
     rng = np.random.default_rng(seed)
@@ -161,7 +161,9 @@ def compute_optimal_steps(
 def build_rows(configs: list[dict]) -> tuple[list[dict], int]:
     rows = []
     global_max_steps = 0
+    ct = 0
     for cfg in configs:
+        ct +=1
         seed_str = f"{cfg['n_obj']}_{cfg['rule']}_{cfg['blicket_indices']}"
         row_seed = int(hashlib.md5(seed_str.encode()).hexdigest()[:8], 16)
         optimal_steps, hyps_elim = compute_optimal_steps(
@@ -184,13 +186,70 @@ def build_rows(configs: list[dict]) -> tuple[list[dict], int]:
                 "optimal_hypotheses_eliminated": hyps_elim,
             }),
         })
+        if ct % 5 == 0:
+            print('num configs optimal steps has been computed for: ', ct)
     return rows, global_max_steps
 
 # ── Targets ───────────────────────────────────────────────────────────────────
 
-N_CONJUNCTIVE = 62
-N_DISJUNCTIVE = 38
+N_CONJUNCTIVE = 35
+N_DISJUNCTIVE = 25
 SEED = 200  # distinct from training (42) and existing eval (100)
+
+def sample_new_eval(
+    num_objects_range: tuple[int, int],
+    n_conjunctive: int,
+    n_disjunctive: int,
+    blicket_range_fn,           # callable(n_obj) -> (min_b, max_b) inclusive
+    exclude_keys: set[tuple],
+    seed: int,
+) -> list[dict]:
+    """General balanced config sampler with a pluggable blicket range function."""
+    rng = np.random.default_rng(seed)
+    lo, hi = num_objects_range
+    seen: set[tuple] = set(exclude_keys)
+    conjunctive: list[dict] = []
+    disjunctive: list[dict] = []
+    while len(conjunctive) < n_conjunctive or len(disjunctive) < n_disjunctive:
+        rule = str(rng.choice(["disjunctive", "conjunctive"]))
+        if rule == "conjunctive" and len(conjunctive) >= n_conjunctive:
+            rule = "disjunctive"
+        elif rule == "disjunctive" and len(disjunctive) >= n_disjunctive:
+            rule = "conjunctive"
+
+        # Normal distribution centered at 9.5 (midpoint of 8-11), clipped to [lo, hi]
+        n_obj = int(np.clip(np.round(rng.normal(9.5, 1.5)), lo, hi))
+        min_b, max_b = blicket_range_fn(n_obj)
+        if min_b > max_b:
+            continue
+        b = int(rng.integers(min_b, max_b + 1))
+        if b > n_obj:
+            continue
+        blicket_indices = tuple(sorted(
+            rng.choice(n_obj, size=b, replace=False).tolist()
+        ))
+        key = (n_obj, rule, b)
+        if key in seen:
+            continue
+        
+        seen.add(key)
+        blickets = [0] * n_obj
+        for idx in blicket_indices:
+            blickets[idx] = 1
+        cfg = {
+            "n_obj": n_obj,
+            "rule": rule,
+            "blickets": blickets,
+            "blicket_indices": list(blicket_indices),
+        }
+        if rule == "conjunctive":
+            conjunctive.append(cfg)
+        else:
+            disjunctive.append(cfg)
+        if (len(conjunctive)+len(disjunctive)) % 10 == 0:
+            print('Count of generated eval examples thus far: ', len(conjunctive)+len(disjunctive))
+
+    return conjunctive + disjunctive
 
 # ── Reproduce exclusion sets from training + existing eval ────────────────────
 
@@ -250,7 +309,7 @@ def original_blicket_range(n_obj):
 
 # New blicket range: [5, floor(0.7 * n_obj)]
 def new_blicket_range(n_obj):
-    return 5, math.floor(0.7 * n_obj)
+    return 2, 8
 
 
 # --- Build training exclusion pool (same params as load_environment) ---
@@ -269,37 +328,22 @@ full_train_pool = sample_balanced_configs(
 )
 train_keys = {(c["n_obj"], c["rule"], tuple(c["blicket_indices"])) for c in full_train_pool}
 
-# --- Build existing eval exclusion sets ---
-print("Generating existing eval configs for exclusion...")
-existing_eval_4_10 = sample_balanced_configs(
-    num_objects_range=(4, 10),
-    n_conjunctive=40,
-    n_disjunctive=40,
-    blicket_range_fn=original_blicket_range,
-    exclude_keys=train_keys,
-    seed=100,
-)
-existing_eval_11_15 = sample_balanced_configs(
-    num_objects_range=(11, 15),
-    n_conjunctive=10,
-    n_disjunctive=10,
-    blicket_range_fn=original_blicket_range,
-    exclude_keys=set(),
-    seed=100,
-)
 
-all_exclude_keys = (
-    train_keys
-    | {(c["n_obj"], c["rule"], tuple(c["blicket_indices"])) for c in existing_eval_4_10}
-    | {(c["n_obj"], c["rule"], tuple(c["blicket_indices"])) for c in existing_eval_11_15}
-)
+num_examples = 250
+n_conj = round(2 * num_examples / 3)
+n_disj = num_examples - n_conj
+train_configs = full_train_pool[:n_conj] + full_train_pool[MAX_N_CONJ:MAX_N_CONJ + n_disj]
+
+train_keys = {(c["n_obj"], c["rule"], sum(c["blickets"])) for c in train_configs}
+
+all_exclude_keys = train_keys
 print(f"  Excluding {len(all_exclude_keys)} existing configs total.")
 
 # ── Sample new eval configs ───────────────────────────────────────────────────
 
 print(f"\nSampling {N_CONJUNCTIVE} conjunctive + {N_DISJUNCTIVE} disjunctive new eval configs...")
-new_configs = sample_balanced_configs(
-    num_objects_range=(8, 15),
+new_configs = sample_new_eval(
+    num_objects_range=(5, 13),
     n_conjunctive=N_CONJUNCTIVE,
     n_disjunctive=N_DISJUNCTIVE,
     blicket_range_fn=new_blicket_range,
@@ -309,7 +353,7 @@ new_configs = sample_balanced_configs(
 print(f"  Sampled {len(new_configs)} configs.")
 
 # Sanity check: verify full disjointness
-new_keys = {(c["n_obj"], c["rule"], tuple(c["blicket_indices"])) for c in new_configs}
+new_keys = {(c["n_obj"], c["rule"], sum(c["blickets"])) for c in new_configs}
 overlap = new_keys & all_exclude_keys
 assert len(overlap) == 0, f"Overlap found: {overlap}"
 assert len(new_keys) == len(new_configs), "Duplicate configs within new eval set"
