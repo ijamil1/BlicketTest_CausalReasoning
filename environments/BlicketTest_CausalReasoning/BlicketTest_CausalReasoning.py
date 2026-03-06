@@ -6,7 +6,7 @@ from itertools import product
 
 import numpy as np
 import verifiers as vf
-from datasets import Dataset
+from datasets import Dataset, load_dataset
 
 MAX_ANSWER_ATTEMPTS = 3
 
@@ -1002,34 +1002,10 @@ def load_environment(num_examples: int = 250) -> vf.Environment:
     dataset = Dataset.from_list(train_rows)
 
     # --- Eval ---
-    # Exclude every config in the full training pool so eval is disjoint from
-    # training regardless of which num_examples is used.
-    train_exclusion_keys = {
-        (c["n_obj"], c["rule"], tuple(c["blicket_indices"])) for c in full_train_pool
-    }
-
-    # 80 eval problems from n ∈ [4, 10]: 40 conjunctive + 40 disjunctive
-    eval_configs_4_10 = sample_balanced_configs(
-        num_objects_range=(4, 10),
-        n_conjunctive=40,
-        n_disjunctive=40,
-        exclude_keys=train_exclusion_keys,
-        seed=100,
-    )
-
-    # 20 eval problems from n ∈ [11, 15]: 10 conjunctive + 10 disjunctive
-    # (no training overlap possible due to disjoint n range)
-    eval_configs_11_15 = sample_balanced_configs(
-        num_objects_range=(11, 15),
-        n_conjunctive=10,
-        n_disjunctive=10,
-        exclude_keys=set(),
-        seed=100,
-    )
-
-    eval_rows, eval_max_steps = build_rows(eval_configs_4_10 + eval_configs_11_15)
-    eval_dataset = Dataset.from_list(eval_rows)
-
+    # Load from HuggingFace; eval_max_steps is the max of max_num_steps across all eval rows.
+    eval_dataset = load_dataset("irfanjamil/BlicketEnv_Eval_Set", split="eval")
+    eval_max_steps = max(json.loads(row["info"])["max_num_steps"] for row in eval_dataset)
+    
     # Build parser (shared between env and rubric)
     parser = vf.XMLParser(fields=["reasoning", "action"], answer_field="action")
 
