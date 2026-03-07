@@ -75,32 +75,12 @@ Visual breakdowns of the training and eval dataset distributions are saved in [`
    - **Answer**: calls `parse_response(..., "answer", ...)` which applies the same strict tag rules then delegates to `parse_blicket_set`. On successful parse, scores with Jaccard similarity and terminates. On failure, sends a reformat message and loops up to `MAX_ANSWER_ATTEMPTS` (3) total attempts; if all exhausted, exits with score 0.
 3. Termination is handled by the base class `has_final_env_response` stop condition.
 
-**Strict action parsing (`parse_response`):**
-
-All action extraction goes through `parse_response(content, phase, num_objects)` which enforces:
-- All `<reasoning>...</reasoning>` blocks are stripped before searching for `<action>` tags.
-- Exactly one `<action>...</action>` must remain — zero or multiple tags yield `None` (unparseable).
-- The extracted action string is then passed to the phase-specific parser (`parse_action` or `parse_blicket_set`).
 
 **Machine activation logic:**
 - **Disjunctive** (OR): machine ON if *any* Blicket is on the machine.
 - **Conjunctive** (AND): machine ON only if *all* Blickets are on the machine.
 
 **Transition to answer phase** happens when the agent sends `exit` or exhausts `max_num_steps`. The transition message includes a full observation history recap so the agent can reason over all experiments at once.
-
-**Action format (exploration):**
-```xml
-<reasoning>...</reasoning>
-<action>put 3 on</action>
-```
-Valid actions: `put {id} on|off` (1-indexed) or `exit`.
-
-**Answer format:**
-```xml
-<reasoning>...</reasoning>
-<action>{1, 3}</action>
-```
-List only the IDs of objects believed to be Blickets inside curly braces. Use `<action>{}</action>` if no objects are believed to be Blickets.
 
 ### File Structure (`BlicketTest_CausalReasoning.py`)
 
@@ -117,7 +97,7 @@ List only the IDs of objects believed to be Blickets inside curly braces. Use `<
   - `_build_transition_message()` — assembles the observation history recap when moving to answer phase.
 
 
-**Reward functions:**
+**Metrics:**
 - `blicket_set_jaccard()` — reads `state["final_score"]`, set by `env_response` as the Jaccard similarity between the predicted Blicket set and the gold set. Returns 0.0 if no valid answer was recorded.
 - `exploration_efficiency()` — `1 - (wasted / parseable_action_count)`, where waste = redundant actions + out-of-range object IDs + non-contiguous configuration revisits. Higher is better. Weight 0.0 (retained for metric logging only).
 - `format_compliance()` — `parseable_action_count / exploration_and_answer_count` across all turns in both phases. Higher is better.
@@ -127,7 +107,7 @@ List only the IDs of objects believed to be Blickets inside curly braces. Use `<
 - `blicket_precision()` — `TP / |predicted|` over the final predicted blicket set. Weight 0.0 (diagnostic: decompose identification failures into overclaiming vs. missing).
 - `blicket_recall()` — `TP / |gold|` over the final predicted blicket set. Weight 0.0 (diagnostic: decompose identification failures into overclaiming vs. missing).
 
-### Reward / Metrics
+### Reward Function
 
 | Component | Weight | Meaning |
 | --------- | ------ | ------- |
@@ -139,3 +119,39 @@ List only the IDs of objects believed to be Blickets inside curly braces. Use `<
 | `hypotheses_eliminated` | 0.00 | Fraction of hypotheses eliminated vs. theoretical maximum (diagnostic) |
 | `blicket_precision` | 0.00 | `TP / \|predicted\|` — overclaiming diagnostic |
 | `blicket_recall` | 0.00 | `TP / \|gold\|` — missing-blicket diagnostic |
+
+### Evaluation Results
+
+Eval run on [`irfanjamil/BlicketEnv_Eval_Set`](https://huggingface.co/datasets/irfanjamil/BlicketEnv_Eval_Set) (60 examples: 35 conjunctive, 25 disjunctive; n ∈ [5, 13]).
+
+**Blicket Set Jaccard** — Jaccard similarity between the predicted and gold Blicket sets, averaged across rollouts per example:
+
+![Blicket Set Jaccard (eval set 2)](eval_plots/blicket_set_jaccard_eval2.png)
+
+### Training Results
+
+The plots below are from an RL training run of **Qwen3-30b-a3b-instruct-2507** using the reward function defined in **environment v0.1.4** (weights: `blicket_set_jaccard` 0.50, `posterior_jaccard` 0.35, `per_step_efficiency_dynamic` 0.10, `format_compliance` 0.05).
+
+**Total reward:**
+
+![Reward](training_plots/reward.png)
+
+**Blicket set Jaccard similarity:**
+
+![Jaccard Similarity](training_plots/jaccard_similarity.png)
+
+**Posterior Jaccard** (hypothesis-space quality at end of exploration):
+
+![Posterior Jaccard](training_plots/posterior_JS.png)
+
+**Per-step information-seeking efficiency:**
+
+![Dynamic Efficiency](training_plots/dynamic_efficiency.png)
+
+**Blicket precision** (`TP / |predicted|`):
+
+![Precision](training_plots/precision.png)
+
+**Blicket recall** (`TP / |gold|`):
+
+![Recall](training_plots/recall.png)
