@@ -124,13 +124,15 @@ Visual breakdowns of the training and eval dataset distributions are saved in [`
 
 Eval run on [`irfanjamil/BlicketEnv_Eval_Set`](https://huggingface.co/datasets/irfanjamil/BlicketEnv_Eval_Set) (60 examples: 35 conjunctive, 25 disjunctive; n ∈ [5, 13]).
 
+Models suffixed with **v1, v2, v3, v4** are our trained models — each representing a distinct RL training run of Qwen3-30b-a3b-instruct-2507 on this environment.
+
 **Blicket Set Jaccard** — Jaccard similarity between the predicted and gold Blicket sets, averaged across rollouts per example:
 
 ![Blicket Set Jaccard (eval set 2)](eval_plots/blicket_set_jaccard_eval2.png)
 
 ### Training Results
 
-The plots below are from an RL training run of **Qwen3-30b-a3b-instruct-2507** using the reward function defined in **environment v0.1.4** (weights: `blicket_set_jaccard` 0.50, `posterior_jaccard` 0.35, `per_step_efficiency_dynamic` 0.10, `format_compliance` 0.05).
+The plots below are from the RL training run that produced **qwen3-30b-a3b-v4** (the v4 model shown in the evaluation results above), using the reward function defined in **environment v0.1.4** (weights: `blicket_set_jaccard` 0.50, `posterior_jaccard` 0.35, `per_step_efficiency_dynamic` 0.10, `format_compliance` 0.05).
 
 **Total reward:**
 
